@@ -16,9 +16,13 @@ import {
   Button,
   FlatList,
   Platform,
-  Animated
+  Animated,
+  Image
 } from 'react-native';
 import WebView from 'react-native-webview';
+import Tts from 'react-native-tts';
+import RNFS from 'react-native-fs';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NativeModules } from 'react-native';
 import { RNCamera } from 'react-native-camera';
 import TextRecognition, { TextRecognitionScript } from "@react-native-ml-kit/text-recognition";
@@ -26,8 +30,13 @@ import wanakana from 'wanakana';
 
 import ImagePicker from 'react-native-image-crop-picker';
 import Icon from 'react-native-vector-icons/Ionicons';
+import Icons from 'react-native-vector-icons/MaterialIcons';
+import Iconss from 'react-native-vector-icons/Feather';
 
-
+import ImageCropper from './components/ImageCropper';
+import Settings from './components/Settings';
+import { checkAndClearCache } from './utils/cacheManager';
+import Toast from 'react-native-toast-message';
 
 const { Python } = NativeModules;
 const { width, height } = Dimensions.get('window');
@@ -112,6 +121,12 @@ const RomajiTranslator = () => {
   const [isWebViewModalVisible, setIsWebViewModalVisible] = useState(false);
   const [searchUrl, setSearchUrl] = useState('');
 
+  const [isSaved, setIsSaved] = useState(false); // Track if the image is saved
+
+  const [isCropping, setIsCropping] = useState(false);
+  const [tempImageUri, setTempImageUri] = useState(null);
+  const [isSettingsVisible, setIsSettingsVisible] = useState(false);
+
   const scrollViewRef = useRef(null);
   const [isTranslating, setIsTranslating] = useState(false);
   const [initialContentReady, setInitialContentReady] = useState(false);
@@ -123,21 +138,21 @@ const RomajiTranslator = () => {
   const [isJapaneseOnly, setIsJapaneseOnly] = useState(true);
   const [galleryPermission, setGalleryPermission] = useState(null);
   const translateX = useRef(new Animated.Value(0)).current;
-  
+
   const handleSearch = (searchQuery) => {
 
     // Clean up the text by replacing newlines with spaces and removing extra spaces
-  const cleanedQuery = searchQuery
-  .replace(/\n/g, ' ')  // Replace all newlines with spaces
-  .replace(/\s+/g, ' ') // Replace multiple spaces with single space
-  .trim();             // Remove leading/trailing spaces
+    const cleanedQuery = searchQuery
+      .replace(/\n/g, ' ')  // Replace all newlines with spaces
+      .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+      .trim();             // Remove leading/trailing spaces
 
     const encodedQuery = encodeURIComponent(cleanedQuery);
 
-    
-    const url = isJapaneseOnly 
-  ? `https://www.google.com/search?q=${encodedQuery}` 
-  : `https://chatgpt.com/search?q=${encodedQuery}`;
+
+    const url = isJapaneseOnly
+      ? `https://www.google.com/search?q=${encodedQuery}`
+      : `https://chatgpt.com/search?q=${encodedQuery}`;
 
     // const url = `https://chatgpt.com/search?q=${encodedQuery}`;
     setSearchUrl(url);
@@ -150,6 +165,30 @@ const RomajiTranslator = () => {
     }
   };
 
+  
+  useEffect(() => {
+    checkAndClearCache();
+  }, []);
+
+    // Load saved state or set default on first-time open
+    useEffect(() => {
+      const loadToggleState = async () => {
+        try {
+          const storedValue = await AsyncStorage.getItem('toggleState');
+          if (storedValue === null) {
+            // First-time open → Set default value (`false`)
+            await AsyncStorage.setItem('toggleState', JSON.stringify(false));
+            setIsJapaneseOnly(true);
+          } else {
+            setIsJapaneseOnly(JSON.parse(storedValue)); // Load saved value
+          }
+        } catch (error) {
+          console.error('Error loading toggle state:', error);
+        }
+      };
+      loadToggleState();
+    }, []);
+
   // Update the animation value when the state changes
   useEffect(() => {
     Animated.timing(translateX, {
@@ -161,35 +200,29 @@ const RomajiTranslator = () => {
 
   }, [isJapaneseOnly]);
 
-  const toggleSwitch = () => {
-    setIsJapaneseOnly(!isJapaneseOnly);
+  const toggleSwitch = async () => {
+    try {
+      const newValue = !isJapaneseOnly;
+      setIsJapaneseOnly(newValue);
+      await AsyncStorage.setItem('toggleState', JSON.stringify(newValue));
+    } catch (error) {
+      console.error('Error saving toggle state:', error);
+    }
   };
 
   const flatListRef = useRef(null);
   const verticalScrollRef = useRef(null);
-
-  const WordCard = useCallback(({ item }) => (
-    <View style={styles.wordCard}>
-      <Text style={styles.japaneseWord}>{item.japanese}</Text>
-      <Text style={styles.romajiWord}>{item.romaji}</Text>
-      <Text style={styles.englishWord}>{item.english}</Text>
-    </View>
-  ), []);
-
-  const renderWordCard = useCallback(({ item }) => (
-    <WordCard item={item} />
-  ), []);
 
   useEffect(() => {
     const triggerPermissionRequests = async () => {
       await requestPermissions().then(
         setTimeout(async () => {
           await requestPermissions(); // Second call after 3 seconds
-  
+
         }, 1000)
       )
     };
-  
+
     triggerPermissionRequests();
   }, []);
 
@@ -200,131 +233,133 @@ const RomajiTranslator = () => {
     };
   }, []);
 
-    // Split translation into smaller chunks to prevent UI blocking
-    const translateInChunks = async (words) => {
-      const CHUNK_SIZE = 5; // Process 5 words at a time
-      const chunks = [];
-      
-      for (let i = 0; i < words.length; i += CHUNK_SIZE) {
-        chunks.push(words.slice(i, i + CHUNK_SIZE));
-      }
-  
-      const translations = new Array(words.length).fill('Translating...');
-      setWordsAndRomaji(prevWords =>
-        prevWords.map((word, index) => ({
-          ...word,
-          english: translations[index]
-        }))
-      );
-  
-      for (let i = 0; i < chunks.length; i++) {
-        if (!isMounted.current) return;
-  
-        const chunk = chunks[i];
-        const startIndex = i * CHUNK_SIZE;
-  
-        try {
-          const chunkTranslations = await Promise.all(
-            chunk.map(word => 
-              word.trim() ? translateJapaneseToEnglish(word) : Promise.resolve('')
-            )
-          );
-  
-          if (!isMounted.current) return;
-  
-          // Update translations array
-          chunkTranslations.forEach((translation, index) => {
-            translations[startIndex + index] = translation;
-          });
-  
-          // Update state with new translations
-          setWordsAndRomaji(prevWords =>
-            prevWords.map((word, index) => ({
-              ...word,
-              english: translations[index]
-            }))
-          );
-  
-          // Give UI thread a chance to breathe
-          await new Promise(resolve => setTimeout(resolve, 50));
-        } catch (error) {
-          console.error('Error translating chunk:', error);
-          // Continue with next chunk even if one fails
-        }
-      }
-    };
+  // Split translation into smaller chunks to prevent UI blocking
+  const translateInChunks = async (words) => {
+    const CHUNK_SIZE = 5; // Process 5 words at a time
+    const chunks = [];
 
+    for (let i = 0; i < words.length; i += CHUNK_SIZE) {
+      chunks.push(words.slice(i, i + CHUNK_SIZE));
+    }
 
-    const requestPermissions = async () => {
+    const translations = new Array(words.length).fill('Translating...');
+    setWordsAndRomaji(prevWords =>
+      prevWords.map((word, index) => ({
+        ...word,
+        english: translations[index]
+      }))
+    );
+
+    for (let i = 0; i < chunks.length; i++) {
+      if (!isMounted.current) return;
+
+      const chunk = chunks[i];
+      const startIndex = i * CHUNK_SIZE;
+
       try {
-        // Define permissions based on Android version
-        const permissions = {
-          CAMERA: PermissionsAndroid.PERMISSIONS.CAMERA,
-          AUDIO: PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-        };
-    
-        if (Platform.Version < 33) {
-          // For Android versions below 13, include READ_EXTERNAL_STORAGE
-          permissions.STORAGE = PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE;
-        } else {
-          // For Android 13 and above, include media-specific permissions
-          permissions.MEDIA_IMAGES = PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES;
-          permissions.MEDIA_VIDEO = PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO;
-          permissions.MEDIA_AUDIO = PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO;
-        }
-    
-        // Request all permissions simultaneously
-        const grantedPermissions = await PermissionsAndroid.requestMultiple(Object.values(permissions));
-    
-        // Check if all permissions were granted
-        const hasAllPermissions = Object.keys(permissions).every(
-          key => grantedPermissions[permissions[key]] === PermissionsAndroid.RESULTS.GRANTED
+        const chunkTranslations = await Promise.all(
+          chunk.map(word =>
+            word.trim() ? translateJapaneseToEnglish(word) : Promise.resolve('')
+          )
         );
-    
-        setHasPermission(hasAllPermissions);
-    
-        if (!hasAllPermissions) {
-          Alert.alert(
-            'Permissions Required',
-            'Please enable all required permissions (camera, audio, and storage) in your device settings to use this feature.',
-            [{ text: 'OK' }]
-          );
-        }
-      } catch (err) {
-        console.error('Permission request error:', err);
-        setError('Failed to request permissions');
-        setHasPermission(false);
-      }
-    };
-    
-    // Function to handle gallery image selection
-    const pickImage = async () => {
-      try {
-        const image = await ImagePicker.openPicker({
-          mediaType: 'photo',
-          compressImageMaxWidth: 2000,
-          compressImageMaxHeight: 2000,
-          compressImageQuality: 0.8,
+
+        if (!isMounted.current) return;
+
+        // Update translations array
+        chunkTranslations.forEach((translation, index) => {
+          translations[startIndex + index] = translation;
         });
-  
-        if (image) {
-          processImage(image.path);
-        }
+
+        // Update state with new translations
+        setWordsAndRomaji(prevWords =>
+          prevWords.map((word, index) => ({
+            ...word,
+            english: translations[index]
+          }))
+        );
+
+        // Give UI thread a chance to breathe
+        await new Promise(resolve => setTimeout(resolve, 50));
       } catch (error) {
-        if (error.message !== 'User cancelled image selection') {
-          console.error('Image picker error:', error);
-          Alert.alert('Error', 'Failed to pick image from gallery');
-        }
+        console.error('Error translating chunk:', error);
+        // Continue with next chunk even if one fails
       }
-    };
-  
+    }
+  };
+
+
+  const requestPermissions = async () => {
+    try {
+      // Define permissions based on Android version
+      const permissions = {
+        CAMERA: PermissionsAndroid.PERMISSIONS.CAMERA,
+        AUDIO: PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+      };
+
+      if (Platform.Version < 33) {
+        // For Android versions below 13, include READ_EXTERNAL_STORAGE
+        permissions.STORAGE = PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE;
+      } else {
+        // For Android 13 and above, include media-specific permissions
+        permissions.MEDIA_IMAGES = PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES;
+        permissions.MEDIA_VIDEO = PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO;
+        permissions.MEDIA_AUDIO = PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO;
+      }
+
+      // Request all permissions simultaneously
+      const grantedPermissions = await PermissionsAndroid.requestMultiple(Object.values(permissions));
+
+      // Check if all permissions were granted
+      const hasAllPermissions = Object.keys(permissions).every(
+        key => grantedPermissions[permissions[key]] === PermissionsAndroid.RESULTS.GRANTED
+      );
+
+      setHasPermission(hasAllPermissions);
+
+      if (!hasAllPermissions) {
+        Alert.alert(
+          'Permissions Required',
+          'Please enable all required permissions (camera, audio, and storage) in your device settings to use this feature.',
+          [{ text: 'OK' }]
+        );
+      }
+    } catch (err) {
+      console.error('Permission request error:', err);
+      setError('Failed to request permissions');
+      setHasPermission(false);
+    }
+  };
+
+  // Function to handle gallery image selection
+  const pickImage = async () => {
+    try {
+      const image = await ImagePicker.openPicker({
+        mediaType: 'photo',
+        compressImageMaxWidth: 2000,
+        compressImageMaxHeight: 2000,
+        compressImageQuality: 0.8,
+      });
+
+      if (image) {
+        setTempImageUri(image.path);
+      setIsCropping(true);
+        // processImage(image.path);
+      }
+    } catch (error) {
+      if (error.message !== 'User cancelled image selection') {
+        console.error('Image picker error:', error);
+        Alert.alert('Error', 'Failed to pick image from gallery');
+      }
+    }
+  };
+
   const isJapaneseText = (text) => {
     const japaneseRegex = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/gu;
     return japaneseRegex.test(text);
   };
 
   const convertToRomaji = (text) => {
-    if(isJapaneseOnly){
+    if (isJapaneseOnly) {
       console.log('text', text);
       if (isJapaneseText(text)) {
         return wanakana.toRomaji(text);
@@ -335,70 +370,15 @@ const RomajiTranslator = () => {
 
   const splitTextIntoWords = (text) => {
     return text.split(/[\s、。]+/).filter(word => word.length > 0);
-  };  
-
-  
-
-  const generateWordsAndRomaji = async (text) => {
-    try {
-      setIsLoading(true);
-      const words = splitTextIntoWords(text);
-
-      if (Platform.OS === 'android') {
-        // Android-specific implementation with Chaquopy
-        const romajiWords = words.map(word => convertToRomaji(word));
-
-        // Translate full text
-        const fullTranslation = await translateJapaneseToEnglish(text);
-        setEnglishText(fullTranslation);
-
-        // Translate individual words with chunking if needed
-        const englishWords = await Promise.all(
-          words.map(async (word) => {
-            try {
-              if (!word.trim()) return '';
-              return await translateJapaneseToEnglish(word);
-            } catch (error) {
-              console.error(`Error translating word: ${word}`, error);
-              return 'Translation error';
-            }
-          })
-        );
-
-        setWordsAndRomaji(
-          words.map((word, index) => ({
-            japanese: word,
-            romaji: romajiWords[index],
-            english: englishWords[index],
-            key: `${index}-${word}`,
-          }))
-        );
-      } else {
-        // iOS implementation
-        // Setting basic word splitting without translation
-        setWordsAndRomaji(
-          words.map((word, index) => ({
-            japanese: word,
-            romaji: romajiWords[index], // Placeholder for romaji
-            english: 'Translation not available on iOS', // Placeholder for English
-            key: `${index}-${word}`,
-          }))
-        );
-
-        setEnglishText('Translation feature is only available on Android devices');
-      }
-    } catch (error) {
-      console.error('Error generating translations:', error);
-      Alert.alert(
-        'Translation Error',
-        Platform.OS === 'android'
-          ? 'Failed to translate some parts of the text. Please try again with a shorter text.'
-          : 'Text processing error occurred. Note that full translation features are only available on Android.'
-      );
-    } finally {
-      setIsLoading(false);
-    }
   };
+
+// Function to speak the Japanese word
+const handleSpeak = (text) => {
+  Tts.setDefaultLanguage('ja-JP'); // Set Japanese language
+  Tts.speak(text);
+};
+
+
 
   const processImage = async (imageUri) => {
     setIsLoading(true);
@@ -411,18 +391,18 @@ const RomajiTranslator = () => {
         isJapaneseOnly ? TextRecognitionScript.JAPANESE : TextRecognitionScript.LATIN
       );
       // console.log('resul:t',result);
-      
+
       // const recognizedText = result.blocks
       //   .map(block => block.text)
       //   .filter(text => isJapaneseOnly ? isJapaneseText(text) : true)
       //   .join("\n");
       const recognizedText = result.blocks
-      .map(block => block.text)
-      .filter(text => isJapaneseOnly ? isJapaneseText(text) : true)
-      .join(" ")
-      .replace(/\s+/g, " "); // Ensures no extra spaces or newlines
-    
-        
+        .map(block => block.text)
+        .filter(text => isJapaneseOnly ? isJapaneseText(text) : true)
+        .join(" ")
+        .replace(/\s+/g, " "); // Ensures no extra spaces or newlines
+
+
 
       if (!recognizedText) {
         throw new Error(isJapaneseOnly ? 'No Japanese text detected' : 'No text detected');
@@ -432,61 +412,61 @@ const RomajiTranslator = () => {
       setRecognizedText(recognizedText);
       const initialRomaji = isJapaneseOnly ? convertToRomaji(recognizedText) : recognizedText;
       setRomajiText(initialRomaji);
-      
 
 
-            const words = splitTextIntoWords(recognizedText);
-      
-            const romajiWords = words.map(word => convertToRomaji(word));
-            
-            setWordsAndRomaji(
-              words.map((word, index) => ({
-                japanese: word,
-                romaji: romajiWords[index],
-                english: 'Waiting for translation...',
-                key: `${index}-${word}`,
-              }))
+
+      const words = splitTextIntoWords(recognizedText);
+
+      const romajiWords = words.map(word => convertToRomaji(word));
+
+      setWordsAndRomaji(
+        words.map((word, index) => ({
+          japanese: word,
+          romaji: romajiWords[index],
+          english: 'Waiting for translation...',
+          key: `${index}-${word}`,
+        }))
+      );
+
+      setIsModalVisible(true);
+      setInitialContentReady(true);
+      setHasPreviousResults(true);
+
+      // Start non-blocking translation process
+      if ((Platform.OS === 'android') && isJapaneseOnly) {
+        setIsProcessingTranslation(true);
+
+        // Start full text translation
+        translateJapaneseToEnglish(recognizedText)
+          .then(fullTranslation => {
+            if (isMounted.current) {
+              setEnglishText(fullTranslation);
+            }
+          })
+          .catch(error => {
+            console.error('Full text translation error:', error);
+            if (isMounted.current) {
+              setEnglishText('Translation failed. Please try again.');
+            }
+          });
+
+        // Start word-by-word translation in chunks
+        translateInChunks(words)
+          .catch(error => {
+            console.error('Word translation error:', error);
+            Alert.alert(
+              'Translation Warning',
+              'Some words could not be translated. Please try again or use the search buttons for individual words.'
             );
-      
-            setIsModalVisible(true);
-            setInitialContentReady(true);
-            setHasPreviousResults(true);
-      
-            // Start non-blocking translation process
-            if ((Platform.OS === 'android') && isJapaneseOnly) {
-              setIsProcessingTranslation(true);
-              
-              // Start full text translation
-              translateJapaneseToEnglish(recognizedText)
-                .then(fullTranslation => {
-                  if (isMounted.current) {
-                    setEnglishText(fullTranslation);
-                  }
-                })
-                .catch(error => {
-                  console.error('Full text translation error:', error);
-                  if (isMounted.current) {
-                    setEnglishText('Translation failed. Please try again.');
-                  }
-                });
-      
-              // Start word-by-word translation in chunks
-              translateInChunks(words)
-                .catch(error => {
-                  console.error('Word translation error:', error);
-                  Alert.alert(
-                    'Translation Warning',
-                    'Some words could not be translated. Please try again or use the search buttons for individual words.'
-                  );
-                })
-                .finally(() => {
-                  if (isMounted.current) {
-                    setIsProcessingTranslation(false);
-                  }
-                });
-            } else {
+          })
+          .finally(() => {
+            if (isMounted.current) {
               setIsProcessingTranslation(false);
             }
+          });
+      } else {
+        setIsProcessingTranslation(false);
+      }
     } catch (error) {
       setError(error.message || 'Failed to process image');
       Alert.alert('Error', error.message || 'Failed to process image');
@@ -495,27 +475,104 @@ const RomajiTranslator = () => {
     }
   };
 
+  const onSaveImage = async() => {
+    if (!tempImageUri || isSaved) {
+      // Toast.show({
+      //   type: 'error',
+      //   text1: 'Error',
+      //   text2: 'No image captured yet.',
+      //   visibilityTime: 3000,
+      // });
+      return;
+    }
+
+    try {
+      const newPath = `${RNFS.PicturesDirectoryPath}/${Date.now()}.jpg`;
+      const fileExists = await RNFS.exists(tempImageUri);
+
+      if (!fileExists) {
+        Toast.show({
+          type: 'error',
+          text1: 'Error',
+          text2: 'The image file does not exist.',
+          visibilityTime: 3000,
+        });
+        return;
+      }
+
+      await RNFS.copyFile(tempImageUri, newPath);
+            // Update the button state
+            setIsSaved(true);
+
+      Toast.show({
+        type: 'success',
+        text1: 'Success',
+        text2: 'Image saved successfully!',
+        visibilityTime: 3000,
+      });
+    } catch (error) {
+      console.error('Error saving image:', error);
+      Toast.show({
+        type: 'error',
+        text1: 'Error',
+        text2: 'Failed to save the image.',
+        visibilityTime: 3000,
+      });
+    }
+  };
+
+  const toastConfig = {
+    success: (props) => (
+      <View style={[styles.toastContainer, styles.successToast]}>
+        <Text style={styles.toastText1}>{props.text1}</Text>
+        <Text style={styles.toastText2}>{props.text2}</Text>
+      </View>
+    ),
+    error: (props) => (
+      <View style={[styles.toastContainer, styles.errorToast]}>
+        <Text style={styles.toastText1}>{props.text1}</Text>
+        <Text style={styles.toastText2}>{props.text2}</Text>
+      </View>
+    ),
+  };
 
   const takePictureAndRecognizeText = async () => {
     if (!camera.current) return;
 
     try {
       const data = await camera.current.takePictureAsync({
-        quality: 0.8,
+        quality: 1,
         base64: true,
       });
 
-      await processImage(data.uri);
+      setTempImageUri(data.uri);
+      setIsSaved(false);
+      console.log('data.uri::::',data.uri);
+      setIsCropping(true);
+
+      // await processImage(data.uri);
     } catch (error) {
       console.error('Camera error:', error);
       Alert.alert('Error', 'Failed to take picture');
     }
   };
 
+  const handleCropComplete = async (croppedImage) => {
+    setIsCropping(false);
+    await processImage(croppedImage.path);
+    // setTempImageUri(croppedImage.path);  // For showing and saving Cropped Image
+    // await processImage(croppedImage.uri || croppedImage);
+  };
+  
+  const handleCropCancel = () => {
+    setIsCropping(false);
+    setTempImageUri(null);
+  };
+
   // Add translation status indicator component
   const TranslationStatus = () => {
     if (!isProcessingTranslation) return null;
-    
+
     return (
       <View style={styles.translationStatus}>
         <ActivityIndicator size="small" color="#007AFF" />
@@ -553,43 +610,46 @@ const RomajiTranslator = () => {
       // Render only one box when isJapaneseOnly is false
       return (
         <ScrollView
-         ref={scrollViewRef}
-        style={styles.translationsContainer}
-        showsVerticalScrollIndicator={true}
-        contentContainerStyle={styles.translationsContent}
-        scrollEventThrottle={16}
-        decelerationRate="normal"
-        removeClippedSubviews={true}
-        maxToRenderPerBatch={10}
-        windowSize={5}
-        keyboardShouldPersistTaps="handled"
+          ref={scrollViewRef}
+          style={styles.translationsContainer}
+          showsVerticalScrollIndicator={true}
+          contentContainerStyle={styles.translationsContent}
+          scrollEventThrottle={16}
+          decelerationRate="normal"
+          removeClippedSubviews={true}
+          maxToRenderPerBatch={10}
+          windowSize={5}
+          keyboardShouldPersistTaps="handled"
         >
-        <View style={styles.translationsContainer}>
-          <View style={styles.translationSection}>
-            <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>Result</Text>
-              <TouchableOpacity
-                style={styles.sectionSearchButton}
-                onPress={() =>
-                  handleSearch(`can you solve this ${recognizedText}`)
-                }
-              >
-                <Text style={styles.searchButtonText}>Solve with ChatGPT</Text>
-              </TouchableOpacity>
+          <View style={styles.translationsContainer}>
+            <View style={styles.translationSection}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Result</Text>
+
+
+
+                <TouchableOpacity
+                  style={styles.sectionSearchButton}
+                  onPress={() =>
+                    handleSearch(`can you solve this ${recognizedText}`)
+                  }
+                >
+                  <Text style={styles.searchButtonText}>Solve with ChatGPT</Text>
+                </TouchableOpacity>
+              </View>
+              <Text selectable style={styles.translationText}>{recognizedText}</Text>
             </View>
-            <Text selectable style={styles.translationText}>{recognizedText}</Text>
+            <TouchableOpacity
+              style={styles.closeButton}
+              onPress={() => setIsModalVisible(false)}
+            >
+              <Text style={styles.closeButtonText}>Close</Text>
+            </TouchableOpacity>
           </View>
-          <TouchableOpacity
-            style={styles.closeButton}
-            onPress={() => setIsModalVisible(false)}
-          >
-            <Text style={styles.closeButtonText}>Close</Text>
-          </TouchableOpacity>
-        </View>
         </ScrollView>
       );
     }
-  
+
     // Render full content when isJapaneseOnly is true
     return (
       <ScrollView
@@ -598,14 +658,17 @@ const RomajiTranslator = () => {
         showsVerticalScrollIndicator={true}
         contentContainerStyle={styles.translationsContent}
         scrollEventThrottle={16}
-        decelerationRate="normal"
+        decelerationRate="fast"
         removeClippedSubviews={true}
         maxToRenderPerBatch={10}
         windowSize={5}
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.translationSection}>
+
+
           <View style={styles.sectionHeader}>
+        
             <Text style={styles.sectionTitle}>Japanese Text</Text>
             <TouchableOpacity
               style={styles.sectionSearchButton}
@@ -618,7 +681,7 @@ const RomajiTranslator = () => {
           </View>
           <Text selectable style={styles.translationText}>{recognizedText}</Text>
         </View>
-  
+
         <View style={styles.translationSection}>
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionTitle}>Romaji</Text>
@@ -633,7 +696,7 @@ const RomajiTranslator = () => {
           </View>
           <Text selectable style={styles.translationText}>{romajiText}</Text>
         </View>
-  
+
         {Platform.OS !== 'ios' && (
           <View style={styles.translationSection}>
             <Text style={styles.sectionTitle}>
@@ -644,22 +707,27 @@ const RomajiTranslator = () => {
             </Text>
           </View>
         )}
-  
+
         <View style={styles.wordCardsContainer}>
           {wordsAndRomaji.map((pair, index) => (
             <View style={styles.space} key={index}>
               <View style={styles.wordCard}>
+                {/* Speaker Icon */}
+            <TouchableOpacity onPress={() => handleSpeak(pair.japanese)} style={styles.speakerIcon}>
+              {/* <Ionicons name="volume-high" size={24} color="black" /> */}
+              <Iconss name="volume-2" size={24} color="black" />
+            </TouchableOpacity>
                 <Text selectable style={styles.japaneseWord}>
                   {pair.japanese}
                 </Text>
                 <Text selectable style={styles.romajiWord}>{pair.romaji}</Text>
-  
+
                 {Platform.OS !== 'ios' && (
                   <Text selectable style={styles.englishWord}>
                     {pair.english}
                   </Text>
                 )}
-  
+
                 <View style={styles.searchButtonsContainer}>
                   <TouchableOpacity
                     style={styles.searchButton}
@@ -677,7 +745,7 @@ const RomajiTranslator = () => {
                   >
                     <Text style={styles.searchButtonText}>ROM</Text>
                   </TouchableOpacity>
-  
+
                   {Platform.OS !== 'ios' && (
                     <TouchableOpacity
                       style={styles.searchButton}
@@ -691,7 +759,7 @@ const RomajiTranslator = () => {
             </View>
           ))}
         </View>
-  
+
         <TouchableOpacity
           style={styles.closeButton}
           onPress={() => setIsModalVisible(false)}
@@ -701,15 +769,24 @@ const RomajiTranslator = () => {
       </ScrollView>
     );
   };
-  
+
 
 
   return (
     <SafeAreaView style={styles.container}>
+      <TouchableOpacity 
+      style={styles.settingsButton}
+      onPress={() => setIsSettingsVisible(true)}
+    >
+      <Icon name="settings-outline" size={24} color="#FFF" />
+    </TouchableOpacity>
+
       <RNCamera
         ref={camera}
         style={styles.preview}
         type={RNCamera.Constants.Type.back}
+        // resizeMode="cover"  
+         ratio="16:9"
         onCameraReady={() => setIsCameraReady(true)}
         androidCameraPermissionOptions={{
           title: 'Permission to use camera',
@@ -721,29 +798,30 @@ const RomajiTranslator = () => {
 
       {isCameraReady && (
         <View style={styles.buttonsContainer}>
-        <TouchableOpacity
-      style={[
-        styles.toggleButton,
-        { backgroundColor: isJapaneseOnly ? '#34C759' : '#CCCCCC' }
-      ]}
-      onPress={toggleSwitch}
-    >
-      <Animated.View
-        style={[
-          styles.slider,
-          { transform: [{ translateX }] }
-        ]}
-      />
-      <Text style={[
-        styles.toggleButtonText,
-        isJapaneseOnly ? styles.textLeft : styles.textRight
-      ]}> 
-        {isJapaneseOnly ? 'JP' : 'ENG'}
-      </Text>
-    </TouchableOpacity>
-          
 
-           {/* Camera Capture Button */}
+          <TouchableOpacity
+            style={[
+              styles.toggleButton,
+              { backgroundColor: isJapaneseOnly ? '#34C759' : '#CCCCCC' }
+            ]}
+            onPress={toggleSwitch}
+          >
+            <Animated.View
+              style={[
+                styles.slider,
+                { transform: [{ translateX }] }
+              ]}
+            />
+            <Text style={[
+              styles.toggleButtonText,
+              isJapaneseOnly ? styles.textLeft : styles.textRight
+            ]}>
+              {isJapaneseOnly ? 'JP' : 'ENG'}
+            </Text>
+          </TouchableOpacity>
+
+
+          {/* Camera Capture Button */}
           <View style={styles.cameraButtonContainer}>
             <View style={styles.captureOuterBorder}>
               <TouchableOpacity
@@ -760,8 +838,8 @@ const RomajiTranslator = () => {
             </View>
           </View>
 
-           {/* Gallery Picker Button */}
-           <TouchableOpacity
+          {/* Gallery Picker Button */}
+          <TouchableOpacity
             style={styles.galleryButton}
             onPress={pickImage}
             disabled={isLoading}
@@ -786,23 +864,50 @@ const RomajiTranslator = () => {
 
       )}
 
-<Modal
+      <Modal
         visible={isModalVisible}
         transparent={true}
         animationType="slide"
         onRequestClose={() => setIsModalVisible(false)}
       >
-        <TouchableWithoutFeedback onPress={() => setIsModalVisible(false)}>
+        {/* <TouchableWithoutFeedback onPress={() => setIsModalVisible(false)}> */}
           <View style={styles.modalBackground}>
-            <TouchableWithoutFeedback onPress={e => e.stopPropagation()}>
+
+            {/* <TouchableWithoutFeedback onPress={e => e.stopPropagation()}> */}
               <View style={styles.modalWrapper}>
+              <Toast
+        config={toastConfig}
+        position="top" // Change position to 'bottom'
+        // topOffset={160} // Adjust offset from the top (if position is 'top')
+        // bottomOffset={20} 
+/>
+
                 <Text style={styles.modalHeader}>Translation Results</Text>
                 <TranslationStatus />
+                <ScrollView>
+
+
+                <View style={styles.imageContainer}>
+          <Image source={{ uri: tempImageUri }} style={styles.resultImage} />
+          <TouchableOpacity 
+            style={styles.saveButton}
+            disabled={isSaved}
+            onPress={() => onSaveImage()}
+          >
+            {isSaved ? (
+              <Icons name="check-circle" size={24} color="#FFF" />
+            ) : (
+              <Icon name="save-outline" size={24} color="#FFF" />
+            )}
+          </TouchableOpacity>
+        </View>
                 {initialContentReady && renderModalContent()}
+                </ScrollView>
+
               </View>
-            </TouchableWithoutFeedback>
+            {/* </TouchableWithoutFeedback> */}
           </View>
-        </TouchableWithoutFeedback>
+        {/* </TouchableWithoutFeedback> */}
       </Modal>
 
       <Modal
@@ -834,27 +939,81 @@ const RomajiTranslator = () => {
           />
         </SafeAreaView>
       </Modal>
+
+      {isCropping && (
+      <ImageCropper
+        imageUri={tempImageUri}
+        onCropComplete={handleCropComplete}
+        onCancel={handleCropCancel}
+      />
+    )}
+
+    <Settings
+      isVisible={isSettingsVisible}
+      onClose={() => setIsSettingsVisible(false)}
+    />
+               
     </SafeAreaView>
   );
 };
 
-const styles = StyleSheet.create({
-  // toggleButton: {
-  //   // position: 'absolute',
-  //   top: -660,
-  //   right: -245,
-  //   backgroundColor: '#007AFF',
-  //   borderRadius: 25,
-  //   padding: 12,
-  //   flexDirection: 'row',
-  //   alignItems: 'center',
-  //   zIndex: 10,
-  //   shadowColor: '#000',
-  //   shadowOffset: { width: 0, height: 2 },
-  //   shadowOpacity: 0.25,
-  //   shadowRadius: 4,
-  //   elevation: 5,
-  // },
+export const styles = StyleSheet.create({
+  speakerIcon: {
+    position: 'absolute',
+    top: 5,
+    right: 5,
+    zIndex: 10, // Ensures it's above other elements
+  },
+  toastContainer: {
+    padding: 15,
+    borderRadius: 10,
+    marginHorizontal: 20,
+    zIndex: 9999, // Ensure toast is always on top
+    position: 'absolute', // Use absolute positioning
+    alignSelf: 'center', // Center the toast horizontally
+    top: -115, // Position the toast 20 units from the bottom
+  },
+  successToast: {
+    backgroundColor: 'green',
+  },
+  errorToast: {
+    backgroundColor: 'red',
+  },
+  toastText1: {
+    color: 'white',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  toastText2: {
+    color: 'white',
+    fontSize: 14,
+  },
+  imageContainer: {
+    position: 'relative',
+    marginBottom: 15,
+  },
+  resultImage: {
+    width: '100%',
+    height: 200,
+    borderRadius: 10,
+  },
+  saveButton: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    borderRadius: 20,
+    padding: 8,
+  },
+  settingsButton: {
+    position: 'absolute',
+    top: 40,
+    left: 20,
+    zIndex: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    borderRadius: 20,
+    padding: 8,
+  },
   textLeft: {
     left: 10, // Move text to the left when "ON"
   },
@@ -877,8 +1036,8 @@ const styles = StyleSheet.create({
     width: 26,
     height: 26,
     borderRadius: 13,
-    borderWidth:2,
-    borderColor:'#34C759',
+    borderWidth: 2,
+    borderColor: '#34C759',
     backgroundColor: '#FFF',
     position: 'absolute',
     top: 2,
@@ -1050,7 +1209,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFF',
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
-    height: height * 0.8,
+    height: height,
     padding: 20,
   },
   modalHeader: {
